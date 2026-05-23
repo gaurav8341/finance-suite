@@ -233,33 +233,44 @@ def _slice_and_fmt(df: pd.DataFrame | None, wanted_rows: list[str]) -> pd.DataFr
 
 
 @mcp.tool()
-def get_company_financials(ticker: str) -> str:
+def get_company_financials(ticker: str, period: str = "annual") -> str:
     """
-    Fetch annual income statement, balance sheet, and cash flow for a company.
+    Fetch income statement, balance sheet, and cash flow for a company.
 
     Args:
         ticker: Stock symbol.
                   NSE  →  append .NS   e.g. "RELIANCE.NS", "TCS.NS", "INFY.NS"
                   BSE  →  append .BO   e.g. "500325.BO"
                   US   →  plain symbol e.g. "AAPL", "MSFT", "GOOGL"
+        period: "annual" (default) — last 4 fiscal years
+                "quarterly"        — last 4 quarters (TTM view)
 
     Returns:
         Structured markdown with:
-          - Income Statement (Revenue → Net Income, last 4 annual periods)
+          - Income Statement (Revenue → Net Income)
           - Balance Sheet (Assets, Liabilities, Equity, Debt)
           - Cash Flow (Operating, Investing, Financing, FCF)
           - Key Ratios (P/E, P/B, ROE, D/E, Beta, 52-week range …)
         Numbers formatted as B (billions) / M (millions).
     """
     t = yf.Ticker(ticker)
-    output: list[str] = [f"## Financials — {ticker}\n"]
+    is_quarterly = period.lower().startswith("q")
+    period_label = "Quarterly" if is_quarterly else "Annual"
+    output: list[str] = [f"## Financials ({period_label}) — {ticker}\n"]
     any_data = False
 
-    sections = [
-        ("Income Statement", lambda: t.income_stmt, _INCOME_ROWS),
-        ("Balance Sheet",    lambda: t.balance_sheet, _BS_ROWS),
-        ("Cash Flow",        lambda: t.cashflow,      _CF_ROWS),
-    ]
+    if is_quarterly:
+        sections = [
+            ("Income Statement", lambda: t.quarterly_income_stmt, _INCOME_ROWS),
+            ("Balance Sheet",    lambda: t.quarterly_balance_sheet, _BS_ROWS),
+            ("Cash Flow",        lambda: t.quarterly_cashflow,      _CF_ROWS),
+        ]
+    else:
+        sections = [
+            ("Income Statement", lambda: t.income_stmt, _INCOME_ROWS),
+            ("Balance Sheet",    lambda: t.balance_sheet, _BS_ROWS),
+            ("Cash Flow",        lambda: t.cashflow,      _CF_ROWS),
+        ]
 
     for title, fetch_fn, wanted in sections:
         try:
@@ -291,6 +302,21 @@ def get_company_financials(ticker: str) -> str:
             ]
             output.append("### Key Ratios\n")
             output.append(_df_to_markdown(ratio_df) + "\n")
+    except Exception:
+        pass
+
+    # Insider transactions
+    try:
+        ins = t.insider_transactions
+        if ins is not None and not ins.empty:
+            keep = [c for c in ["startDate", "shares", "value", "text", "filerName", "filerRelation", "transactionText"] if c in ins.columns]
+            ins = ins[keep].copy()
+            if "startDate" in ins.columns:
+                ins["startDate"] = pd.to_datetime(ins["startDate"], unit="s", errors="coerce").dt.strftime("%Y-%m-%d")
+            if "value" in ins.columns:
+                ins["value"] = ins["value"].apply(_fmt_large)
+            output.append("### Insider Transactions (Recent)\n")
+            output.append(_df_to_markdown(ins, max_rows=10) + "\n")
     except Exception:
         pass
 
@@ -438,6 +464,130 @@ def get_options_chain(ticker: str, expiry_date: str | None = None) -> str:
         f"**All available expiries:** {exp_preview}\n\n"
     )
     return header + _fmt_chain(chain.calls, "Calls") + "\n\n" + _fmt_chain(chain.puts, "Puts")
+
+
+# ---------------------------------------------------------------------------
+# Tool 5 – get_analyst_data
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_analyst_data(ticker: str) -> str:
+    """
+    Fetch forward-looking analyst intelligence for a stock.
+
+    Sections returned (where available):
+      - Analyst Price Targets  : mean / high / low / median / current price
+      - Recommendations        : period-by-period Buy / Hold / Sell counts
+      - EPS Estimates          : consensus EPS for current quarter, next quarter, this year, next year
+      - Revenue Estimates      : consensus revenue for same horizons
+      - EPS Trend              : how consensus EPS has shifted (current vs 7d/30d/60d/90d ago)
+      - EPS Revisions          : # of analyst upgrades vs downgrades in last 7d / 30d
+      - Growth Estimates       : expected EPS/revenue growth for each horizon
+
+    Args:
+        ticker: Stock symbol.
+                  NSE  →  "RELIANCE.NS", "TCS.NS"
+                  US   →  "AAPL", "MSFT", "NVDA"
+
+    Returns:
+        Markdown report with all available analyst data.
+    """
+    t = yf.Ticker(ticker)
+    output: list[str] = [f"## Analyst Data — {ticker}\n"]
+    any_data = False
+
+    # ── 1. Price Targets ──────────────────────────────────────────────────────
+    try:
+        pt = t.analyst_price_targets
+        if pt and isinstance(pt, dict) and len(pt) > 0:
+            any_data = True
+            pt_df = pd.DataFrame.from_dict(pt, orient="index", columns=["Value"])
+            pt_df["Value"] = pt_df["Value"].apply(
+                lambda x: f"{x:.2f}" if isinstance(x, float) else str(x)
+            )
+            output.append("### Analyst Price Targets\n")
+            output.append(_df_to_markdown(pt_df) + "\n")
+    except Exception:
+        pass
+
+    # ── 2. Recommendations Summary ────────────────────────────────────────────
+    try:
+        rec = t.recommendations_summary
+        if rec is not None and not rec.empty:
+            any_data = True
+            output.append("### Recommendations Summary\n")
+            output.append(_df_to_markdown(rec) + "\n")
+    except Exception:
+        pass
+
+    # ── 3. EPS Estimates ──────────────────────────────────────────────────────
+    try:
+        eps_est = t.earnings_estimate
+        if eps_est is not None and not eps_est.empty:
+            any_data = True
+            output.append("### EPS Estimates (Consensus)\n")
+            output.append(_df_to_markdown(eps_est) + "\n")
+    except Exception:
+        pass
+
+    # ── 4. Revenue Estimates ──────────────────────────────────────────────────
+    try:
+        rev_est = t.revenue_estimate
+        if rev_est is not None and not rev_est.empty:
+            # Format revenue numbers
+            rev_fmt = rev_est.copy()
+            for col in rev_fmt.columns:
+                rev_fmt[col] = rev_fmt[col].apply(
+                    lambda x: _fmt_large(x) if isinstance(x, (int, float)) else str(x)
+                )
+            any_data = True
+            output.append("### Revenue Estimates (Consensus)\n")
+            output.append(_df_to_markdown(rev_fmt) + "\n")
+    except Exception:
+        pass
+
+    # ── 5. EPS Trend ──────────────────────────────────────────────────────────
+    try:
+        trend = t.eps_trend
+        if trend is not None and not trend.empty:
+            any_data = True
+            output.append("### EPS Trend (Consensus Drift)\n")
+            output.append(_df_to_markdown(trend) + "\n")
+    except Exception:
+        pass
+
+    # ── 6. EPS Revisions ─────────────────────────────────────────────────────
+    try:
+        rev = t.eps_revisions
+        if rev is not None and not rev.empty:
+            any_data = True
+            output.append("### EPS Revisions (Upgrades vs Downgrades)\n")
+            output.append(_df_to_markdown(rev) + "\n")
+    except Exception:
+        pass
+
+    # ── 7. Growth Estimates ───────────────────────────────────────────────────
+    try:
+        growth = t.growth_estimates
+        if growth is not None and not growth.empty:
+            growth_fmt = growth.copy()
+            for col in growth_fmt.columns:
+                growth_fmt[col] = growth_fmt[col].apply(
+                    lambda x: f"{x*100:.1f}%" if isinstance(x, float) and abs(x) < 100 else str(x)
+                )
+            any_data = True
+            output.append("### Growth Estimates\n")
+            output.append(_df_to_markdown(growth_fmt) + "\n")
+    except Exception:
+        pass
+
+    if not any_data:
+        return (
+            f"No analyst data found for `{ticker}`. "
+            "This is common for newly listed or thinly covered stocks."
+        )
+
+    return "\n".join(output)
 
 
 # ---------------------------------------------------------------------------
