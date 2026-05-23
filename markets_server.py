@@ -120,7 +120,7 @@ def screen_market(
                   Common fields:
                     market_cap_basic             Market cap in USD
                     price_earnings_ttm           Trailing P/E
-                    price_to_book_fq             Price-to-book
+                    price_book_ratio             Price-to-book
                     debt_to_equity               D/E ratio
                     return_on_equity             ROE (0–1 scale, e.g. 0.15 = 15%)
                     earnings_per_share_basic_ttm EPS (TTM)
@@ -151,7 +151,7 @@ def screen_market(
 
     default_cols = [
         "name", "close", "volume", "market_cap_basic",
-        "price_earnings_ttm", "price_to_book_fq",
+        "price_earnings_ttm", "price_book_ratio",
         "return_on_equity", "debt_to_equity", "sector",
     ]
     fetch_cols = list(dict.fromkeys(default_cols + (columns or [])))
