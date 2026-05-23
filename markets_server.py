@@ -994,6 +994,163 @@ def get_analyst_data(ticker: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Tool 8 – get_filings
+# ---------------------------------------------------------------------------
+
+# BSE codes for common Indian stocks (ticker → BSE code)
+_NSE_TO_BSE: dict[str, str] = {
+    "RELIANCE":     "500325",
+    "TCS":          "532540",
+    "HDFCBANK":     "500180",
+    "INFY":         "500209",
+    "ICICIBANK":    "532174",
+    "HINDUNILVR":   "500696",
+    "SBIN":         "500112",
+    "BAJFINANCE":   "500034",
+    "BHARTIARTL":   "532454",
+    "KOTAKBANK":    "500247",
+    "WIPRO":        "507685",
+    "AXISBANK":     "532215",
+    "LT":           "500510",
+    "ASIANPAINT":   "500820",
+    "MARUTI":       "532500",
+    "TITAN":        "500114",
+    "SUNPHARMA":    "524715",
+    "NESTLEIND":    "500790",
+    "ULTRACEMCO":   "532538",
+    "TECHM":        "532755",
+}
+
+
+@mcp.tool()
+def get_filings(
+    ticker: str,
+    filing_type: str = "all",
+    limit: int = 10,
+) -> str:
+    """
+    Get the latest regulatory filings for a company.
+
+    For US stocks (NYSE/NASDAQ): Returns SEC filings (10-Q, 10-K, 8-K, etc.)
+    with direct links to the actual documents via yfinance.
+
+    For Indian stocks (NSE/BSE): yfinance has no filing data. Returns direct
+    links to BSE and NSE filing portals for the company.
+
+    Args:
+        ticker:       Stock symbol — e.g. "AAPL", "MSFT", "RELIANCE.NS"
+        filing_type:  Filter by filing type (US only):
+                        "all"  — all filings (default)
+                        "10-Q" — quarterly reports
+                        "10-K" — annual reports
+                        "8-K"  — material events / earnings releases
+                        "DEF 14A" — proxy statements
+        limit:        Max number of filings to return (default 10, max 30)
+
+    Returns:
+        For US stocks: table of filings with date, type, title, and document links.
+        For Indian stocks: direct BSE/NSE portal links for the company.
+    """
+    is_indian = ticker.endswith(".NS") or ticker.endswith(".BO")
+
+    # ── Indian stocks — portal links ──────────────────────────────────────────
+    if is_indian:
+        base = ticker.replace(".NS", "").replace(".BO", "").upper()
+        bse_code = _NSE_TO_BSE.get(base)
+
+        output = [f"## Filings — {ticker}\n"]
+        output.append(
+            "> yfinance does not carry NSE/BSE filing data. "
+            "Use the links below to access filings directly.\n"
+        )
+
+        output.append("### NSE Filing Portal\n")
+        output.append(
+            f"- **Corporate Announcements:** "
+            f"https://www.nseindia.com/companies-listing/corporate-filings-announcements\n"
+            f"- **Financial Results:** "
+            f"https://www.nseindia.com/companies-listing/corporate-filings-financial-results\n"
+            f"- **Annual Reports:** "
+            f"https://www.nseindia.com/companies-listing/corporate-filings-annual-reports\n"
+            f"\n_Search for `{base}` on the NSE portal._\n"
+        )
+
+        output.append("### BSE Filing Portal\n")
+        if bse_code:
+            output.append(
+                f"- **Quarterly Results:** "
+                f"https://www.bseindia.com/stock-share-price/{base.lower()}/{bse_code}/financials-quarterly-results/\n"
+                f"- **All Announcements:** "
+                f"https://www.bseindia.com/corporates/ann.html?Code={bse_code}\n"
+                f"- **Annual Reports:** "
+                f"https://www.bseindia.com/bseplus/AnnualReport/{bse_code}/\n"
+            )
+        else:
+            output.append(
+                f"- Search for `{base}` at: https://www.bseindia.com/corporates/ann.html\n"
+            )
+
+        # Try to get ISIN from yfinance info
+        try:
+            info = yf.Ticker(ticker).info
+            isin = info.get("isin") or info.get("ISIN")
+            if isin:
+                output.append(f"\n**ISIN:** `{isin}`\n")
+            company_name = info.get("longName") or info.get("shortName")
+            if company_name:
+                output.append(f"**Company:** {company_name}\n")
+        except Exception:
+            pass
+
+        return "\n".join(output)
+
+    # ── US stocks — SEC filings via yfinance ──────────────────────────────────
+    t = yf.Ticker(ticker)
+    try:
+        filings = t.sec_filings
+    except Exception as exc:
+        return f"Error fetching filings for `{ticker}`: {exc}"
+
+    if not filings:
+        return f"No SEC filings found for `{ticker}`."
+
+    # Filter by type
+    ftype = filing_type.upper()
+    if ftype != "ALL":
+        filings = [f for f in filings if f.get("type", "").upper() == ftype]
+        if not filings:
+            return f"No `{filing_type}` filings found for `{ticker}`."
+
+    filings = filings[:min(int(limit), 30)]
+
+    output = [f"## SEC Filings — {ticker}\n"]
+
+    rows = []
+    for f in filings:
+        date     = str(f.get("date", ""))[:10]
+        ftype_   = f.get("type", "N/A")
+        title    = f.get("title", "")
+        exhibits = f.get("exhibits", {})
+
+        # Build clickable links for each exhibit
+        links = []
+        for ex_type, url in exhibits.items():
+            links.append(f"[{ex_type}]({url})")
+        link_str = " · ".join(links) if links else f.get("edgarUrl", "N/A")
+
+        rows.append({
+            "Date":    date,
+            "Type":    ftype_,
+            "Title":   title[:60],
+            "Documents": link_str,
+        })
+
+    df = pd.DataFrame(rows)
+    output.append(_df_to_markdown(df, max_rows=30))
+    return "\n".join(output)
+
+
+# ---------------------------------------------------------------------------
 # Chart helpers
 # ---------------------------------------------------------------------------
 
