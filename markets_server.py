@@ -22,9 +22,17 @@ Tools:
   get_company_financials   – Income statement, balance sheet, cash flow (yfinance)
   get_market_price_history – Historical OHLCV for stocks, ETFs, commodities, forex
   get_options_chain        – Calls/Puts chain with IV, volume, open interest
+  get_field_history        – Single financial field across N periods
+  get_ownership_and_trades – Institutional/insider ownership + trade activity
+  get_analyst_data         – Price targets, recommendations, EPS/revenue estimates
+  get_filings              – SEC filings (US) / BSE+NSE portal links (India)
+  get_tv_snapshot          – TradingView snapshot: ROIC, period returns, rel. volume
+  plot_price               – Price + volume chart (line/bar, dark theme)
+  plot_chart               – Generic chart (bar/line/area/pie/scatter, any data)
 
 Run with:
-  uv run markets_server.py
+  uv run markets_server.py                           # stdio (Claude Code / Desktop)
+  uv run markets_server.py --transport sse --port 8000  # HTTP/SSE (web clients)
 """
 
 from __future__ import annotations
@@ -1151,6 +1159,163 @@ def get_filings(
 
 
 # ---------------------------------------------------------------------------
+# Tool 9 – get_tv_snapshot
+# ---------------------------------------------------------------------------
+
+# Fields available in TradingView but NOT in yfinance
+_TV_SNAPSHOT_FIELDS = [
+    "name",
+    "close",
+    "change",                       # day % change
+    "relative_volume_10d_calc",     # today's volume vs 10-day avg
+    "return_on_invested_capital",   # ROIC
+    "return_on_equity",             # ROE (TradingView normalised)
+    "Perf.1M",                      # 1-month return %
+    "Perf.3M",                      # 3-month return %
+    "Perf.6M",                      # 6-month return %
+    "Perf.YTD",                     # year-to-date return %
+    "Perf.Y",                       # 1-year return %
+    "price_earnings_ttm",           # Trailing P/E
+    "price_book_ratio",             # P/B
+    "gross_margin",                 # Gross margin %
+    "net_profit_margin",            # Net profit margin %
+    "market_cap_basic",             # Market cap (USD)
+    "earnings_per_share_basic_ttm", # EPS TTM
+]
+
+
+@mcp.tool()
+def get_tv_snapshot(ticker: str) -> str:
+    """
+    Get a TradingView snapshot for a stock.
+
+    Provides metrics not available via yfinance, including:
+      - ROIC (Return on Invested Capital)
+      - Period performance: 1M / 3M / 6M / YTD / 1Y
+      - Relative volume (today vs 10-day average)
+      - TradingView-normalised margins (excludes one-time items)
+
+    Args:
+        ticker: Stock symbol — e.g. "HINDUNILVR.NS", "RELIANCE.NS", "AAPL", "MSFT"
+                  NSE  →  append .NS   e.g. "TCS.NS"
+                  US   →  plain symbol e.g. "NVDA"
+
+    Returns:
+        Markdown snapshot with TradingView real-time / daily-refresh metrics.
+    """
+    # ── Convert to TradingView ticker format ──────────────────────────────────
+    if ticker.endswith(".NS"):
+        symbol = ticker[:-3].upper()
+        tv_ticker = f"NSE:{symbol}"
+        market = "india"
+    elif ticker.endswith(".BO"):
+        symbol = ticker[:-3].upper()
+        tv_ticker = f"BSE:{symbol}"
+        market = "india"
+    else:
+        symbol = ticker.upper()
+        tv_ticker = symbol   # TradingView resolves AAPL → NASDAQ:AAPL automatically
+        market = "america"
+
+    # ── Query TradingView ─────────────────────────────────────────────────────
+    try:
+        q = (
+            Query()
+            .select(*_TV_SNAPSHOT_FIELDS)
+            .set_markets(market)
+            .where(tv_col("ticker") == tv_ticker)
+            .limit(1)
+        )
+        count, df = q.get_scanner_data()
+    except Exception as exc:
+        return f"TradingView query error for `{ticker}`: {exc}"
+
+    if df.empty:
+        # Fallback: filter by symbol name (without exchange prefix)
+        try:
+            q2 = (
+                Query()
+                .select(*_TV_SNAPSHOT_FIELDS)
+                .set_markets(market)
+                .where(tv_col("name") == symbol)
+                .limit(1)
+            )
+            count, df = q2.get_scanner_data()
+        except Exception:
+            pass
+
+    if df.empty:
+        return (
+            f"No TradingView data found for `{ticker}` (tried `{tv_ticker}`).\n"
+            "For Indian stocks use the `.NS` suffix — e.g. `HINDUNILVR.NS`."
+        )
+
+    row = df.iloc[0]
+
+    # ── Format output ─────────────────────────────────────────────────────────
+    sections: dict[str, dict[str, str]] = {
+        "Price & Volume":   {},
+        "Period Returns":   {},
+        "Fundamentals":     {},
+    }
+
+    def _pct(v: Any) -> str:
+        return f"{float(v):+.2f}%" if pd.notna(v) else "N/A"
+
+    def _ratio(v: Any) -> str:
+        return f"{float(v):.2f}" if pd.notna(v) else "N/A"
+
+    # Price & volume
+    sv = sections["Price & Volume"]
+    for col, label, fmt in [
+        ("close",                    "Last Price",            lambda v: f"{float(v):.2f}"),
+        ("change",                   "Day Change",            _pct),
+        ("relative_volume_10d_calc", "Relative Volume (10d)", lambda v: f"{float(v):.2f}×"),
+    ]:
+        if col in df.columns and pd.notna(row.get(col)):
+            sv[label] = fmt(row[col])
+
+    # Period returns
+    sp = sections["Period Returns"]
+    for col, label in [
+        ("Perf.1M",  "1 Month"),
+        ("Perf.3M",  "3 Months"),
+        ("Perf.6M",  "6 Months"),
+        ("Perf.YTD", "YTD"),
+        ("Perf.Y",   "1 Year"),
+    ]:
+        if col in df.columns and pd.notna(row.get(col)):
+            sp[label] = _pct(row[col])
+
+    # Fundamentals
+    sf = sections["Fundamentals"]
+    for col, label, fmt in [
+        ("return_on_invested_capital",   "ROIC",            _pct),
+        ("return_on_equity",             "ROE",             _pct),
+        ("gross_margin",                 "Gross Margin",    _pct),
+        ("net_profit_margin",            "Net Margin",      _pct),
+        ("price_earnings_ttm",           "P/E TTM",         _ratio),
+        ("price_book_ratio",             "P/B",             _ratio),
+        ("earnings_per_share_basic_ttm", "EPS TTM",         _ratio),
+        ("market_cap_basic",             "Market Cap",      _fmt_large),
+    ]:
+        if col in df.columns and pd.notna(row.get(col)):
+            sf[label] = fmt(row[col])
+
+    output = [f"## TradingView Snapshot — {ticker}\n"
+              "_Source: TradingView  (real-time price · daily fundamental refresh)_\n"]
+
+    for section_name, items in sections.items():
+        if not items:
+            continue
+        sec_df = pd.DataFrame.from_dict(items, orient="index", columns=["Value"])
+        output.append(f"\n### {section_name}\n")
+        output.append(_df_to_markdown(sec_df))
+
+    return "\n".join(output)
+
+
+# ---------------------------------------------------------------------------
 # Chart helpers
 # ---------------------------------------------------------------------------
 
@@ -1417,4 +1582,24 @@ def plot_chart(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    mcp.run(transport="stdio")
+    import argparse
+    parser = argparse.ArgumentParser(description="Markets MCP Server")
+    parser.add_argument(
+        "--transport", choices=["stdio", "sse", "streamable-http"],
+        default="stdio",
+        help="Transport type (default: stdio for Claude Desktop / Claude Code)",
+    )
+    parser.add_argument(
+        "--host", default="0.0.0.0",
+        help="Host to bind to for HTTP transports (default: 0.0.0.0)",
+    )
+    parser.add_argument(
+        "--port", type=int, default=8000,
+        help="Port for HTTP transports (default: 8000)",
+    )
+    args = parser.parse_args()
+
+    if args.transport == "stdio":
+        mcp.run(transport="stdio")
+    else:
+        mcp.run(transport=args.transport, host=args.host, port=args.port)
